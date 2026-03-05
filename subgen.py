@@ -36,6 +36,35 @@ NEW NAME → OLD NAME (for backwards compatibility):
 - SKIP_IF_AUDIO_LANGUAGES → SKIP_IF_AUDIO_TRACK_IS
 - SKIP_ONLY_SUBGEN_SUBTITLES → ONLY_SKIP_IF_SUBGEN_SUBTITLE
 - SKIP_IF_NO_LANGUAGE_BUT_SUBTITLES_EXIST → SKIP_IF_LANGUAGE_IS_NOT_SET_BUT_SUBTITLES_EXIST
+- ENABLE_BAIDU_TRANSLATE → (new, no legacy name)
+- BAIDU_TRANSLATE_APPID → (new, no legacy name)
+- BAIDU_TRANSLATE_SECRET → (new, no legacy name)
+- BAIDU_TRANSLATE_TARGET_LANGUAGE → (new, no legacy name)
+- ENABLE_GOOGLE_TRANSLATE → (new, no legacy name)
+- GOOGLE_TRANSLATE_API_KEY → (new, no legacy name)
+- GOOGLE_TRANSLATE_TARGET_LANGUAGE → (new, no legacy name)
+- TRANSLATION_SERVICE → (new, no legacy name)
+
+TRANSLATION SERVICES:
+Two translation services are supported - Baidu Translate and Google Translate.
+You can enable one or both services. If both are enabled, Google Translate takes precedence.
+
+Baidu Translate (百度翻译):
+- ENABLE_BAIDU_TRANSLATE: Set to 'true' to enable Baidu translation
+- BAIDU_TRANSLATE_APPID: Your Baidu Translation API app ID
+- BAIDU_TRANSLATE_SECRET: Your Baidu Translation API secret key
+- BAIDU_TRANSLATE_TARGET_LANGUAGE: Target language code (default: 'zh' for Chinese)
+  Get API credentials at: https://fanyi-api.baidu.com/
+
+Google Translate (Google Cloud Translation):
+- ENABLE_GOOGLE_TRANSLATE: Set to 'true' to enable Google translation
+- GOOGLE_TRANSLATE_API_KEY: Your Google Cloud Translation API key
+- GOOGLE_TRANSLATE_TARGET_LANGUAGE: Target language code (default: 'zh-CN' for Chinese Simplified)
+  Get API key at: https://cloud.google.com/translate
+
+Service Selection:
+- TRANSLATION_SERVICE: Set to 'baidu' or 'google' to explicitly select a service
+  (Only needed if you want to specify which service to use when both are configured)
 
 MIGRATION GUIDE:
 Users can gradually migrate to the new names. Both will work simultaneously during the
@@ -62,9 +91,12 @@ from fastapi.responses import StreamingResponse
 import numpy as np
 import stable_whisper
 from stable_whisper import Segment
+import hashlib
+import random
 import requests
 import av
 import ffmpeg
+import os
 import ast
 from watchdog.observers.polling import PollingObserver as Observer
 from watchdog.events import FileSystemEventHandler
@@ -144,6 +176,20 @@ detect_language_length = int(os.getenv('DETECT_LANGUAGE_LENGTH', 30))
 detect_language_offset = int(os.getenv('DETECT_LANGUAGE_OFFSET', 0))
 model_cleanup_delay = int(os.getenv('MODEL_CLEANUP_DELAY', 30))
 asr_timeout = int(os.getenv('ASR_TIMEOUT', 18000))
+
+# Baidu Translation API Configuration
+baidu_translate_appid = os.getenv('BAIDU_TRANSLATE_APPID', '')
+baidu_translate_secret = os.getenv('BAIDU_TRANSLATE_SECRET', '')
+enable_baidu_translate = convert_to_bool(os.getenv('ENABLE_BAIDU_TRANSLATE', False))
+baidu_translate_target_language = os.getenv('BAIDU_TRANSLATE_TARGET_LANGUAGE', 'zh')  # Default to Chinese
+
+# Google Translate API Configuration
+google_translate_api_key = os.getenv('GOOGLE_TRANSLATE_API_KEY', '')
+enable_google_translate = convert_to_bool(os.getenv('ENABLE_GOOGLE_TRANSLATE', False))
+google_translate_target_language = os.getenv('GOOGLE_TRANSLATE_TARGET_LANGUAGE', 'zh-CN')  # Default to Chinese (Simplified)
+
+# Translation Service Selection (priority: google > baidu)
+translation_service = os.getenv('TRANSLATION_SERVICE', 'baidu').lower()  # 'baidu' or 'google'
 
 # Skip Configuration - with backwards compatibility
 skipifexternalsub = get_env_with_fallback('SKIP_IF_EXTERNAL_SUBTITLES_EXIST', 'SKIPIFEXTERNALSUB', False, convert_to_bool)
@@ -497,6 +543,216 @@ class ProgressHandler:
                 
 TIME_OFFSET = 5
 
+def baidu_translate_text(text, from_lang='auto', to_lang='zh'):
+    """
+    Translate text using Baidu Translation API.
+
+    Args:
+        text: The text to translate.
+        from_lang: Source language code (default: 'auto' for auto-detect).
+        to_lang: Target language code (default: 'zh' for Chinese).
+
+    Returns:
+        str: Translated text, or original text if translation fails.
+    """
+    if not baidu_translate_appid or not baidu_translate_secret:
+        logging.warning("Baidu Translation API credentials not configured, skipping translation.")
+        return text
+
+    try:
+        # Generate random salt for request
+        salt = str(random.randint(32768, 65536))
+
+        # Create sign using MD5 hash
+        sign_str = f"{baidu_translate_appid}{text}{salt}{baidu_translate_secret}"
+        sign = hashlib.md5(sign_str.encode('utf-8')).hexdigest()
+
+        # Prepare request parameters
+        params = {
+            'q': text,
+            'from': from_lang,
+            'to': to_lang,
+            'appid': baidu_translate_appid,
+            'salt': salt,
+            'sign': sign
+        }
+        logging.debug(f"Baidu API params: {params}")
+        # Send request to Baidu Translation API
+        response = requests.get('https://fanyi-api.baidu.com/api/trans/vip/translate', params=params, timeout=30)
+        response.raise_for_status()
+
+        # Parse response
+        json_response = response.json()
+        logging.debug(f"Baidu API response: {json_response}")
+
+        # Check for error in response
+        if 'error_code' in json_response:
+            logging.warning(f"Baidu Translation API error: {json_response['error_code']}")
+            return text
+
+        # Extract translated text - support both 'trans_result' and 'result' formats
+        trans_result = json_response.get('trans_result') or json_response.get('result', {})
+
+        if trans_result:
+            # Handle list format
+            if isinstance(trans_result, list):
+                translated_text = '\n'.join([item.get('dst', item.get('content', '')) for item in trans_result])
+                return translated_text
+            # Handle dict format with 'content' key
+            elif isinstance(trans_result, dict):
+                content = trans_result.get('content', '')
+                if content:
+                    return content
+
+        logging.warning(f"Baidu Translation API returned empty result: {json_response}")
+        return text
+
+    except requests.exceptions.Timeout:
+        logging.error(f"Baidu Translation API request timeout")
+        return text
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Baidu Translation API request failed: {e}")
+        return text
+    except json.JSONDecodeError as e:
+        logging.error(f"Baidu Translation API JSON decode error: {e}")
+        return text
+    except Exception as e:
+        logging.error(f"Baidu Translation API error: {e}")
+        return text
+
+
+def google_translate_text(text, from_lang='auto', to_lang='zh-CN'):
+    """
+    Translate text using Google Cloud Translation API.
+
+    Args:
+        text: The text to translate.
+        from_lang: Source language code (default: 'auto' for auto-detect).
+        to_lang: Target language code (default: 'zh-CN' for Chinese Simplified).
+
+    Returns:
+        str: Translated text, or original text if translation fails.
+    """
+    if not google_translate_api_key:
+        logging.warning("Google Translate API key not configured, skipping translation.")
+        return text
+
+    try:
+        # Prepare request parameters for Google Cloud Translation API v2
+        params = {
+            'q': text,
+            'source': from_lang if from_lang != 'auto' else 'detect',
+            'target': to_lang,
+            'format': 'text',
+            'key': google_translate_api_key
+        }
+        logging.debug(f"Google Translate API params: {params}")
+
+        # Send request to Google Cloud Translation API
+        response = requests.post(
+            'https://translation.googleapis.com/language/translate/v2',
+            data=params,
+            timeout=30
+        )
+        response.raise_for_status()
+
+        # Parse response
+        json_response = response.json()
+        logging.debug(f"Google Translate API response: {json_response}")
+
+        # Extract translated text
+        data = json_response.get('data', {})
+        translations = data.get('translations', [])
+
+        if translations and len(translations) > 0:
+            translated_text = translations[0].get('translatedText', '')
+            return translated_text
+
+        logging.warning(f"Google Translate API returned empty result: {json_response}")
+        return text
+
+    except requests.exceptions.Timeout:
+        logging.error(f"Google Translate API request timeout")
+        return text
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Google Translate API request failed: {e}")
+        return text
+    except json.JSONDecodeError as e:
+        logging.error(f"Google Translate API JSON decode error: {e}")
+        return text
+    except Exception as e:
+        logging.error(f"Google Translate API error: {e}")
+        return text
+
+
+def translate_segments(result, target_lang='zh', service='baidu'):
+    """
+    Translate all subtitle segments and create bilingual subtitles.
+
+    Args:
+        result: The transcription result object with segments.
+        target_lang: Target language code for translation.
+        service: Translation service to use ('baidu' or 'google').
+
+    Returns:
+        list: List of segments with bilingual text (original + translation).
+    """
+    logging.info(f"Translating {len(result.segments)} segments using {service}...")
+
+    translated_segments = []
+    for i, segment in enumerate(result.segments, 1):
+        logging.debug(f"Translating segment {i}/{len(result.segments)}: {segment.text[:50]}...")
+
+        # Translate the segment text
+        if service == 'google':
+            translated_text = google_translate_text(segment.text, to_lang=target_lang)
+        else:
+            translated_text = baidu_translate_text(segment.text, to_lang=target_lang)
+
+        # Create bilingual text (original + translation)
+        bilingual_text = f"{segment.text}\n{translated_text}"
+
+        # Create new segment with bilingual text
+        # Note: words must be None, otherwise text will be reconstructed from words
+        new_segment = Segment(
+            start=segment.start,
+            end=segment.end,
+            text=bilingual_text,
+            words=None,
+            id=segment.id
+        )
+        translated_segments.append(new_segment)
+
+    logging.info("Translation complete.")
+    return translated_segments
+
+
+def translate_segments_to_chinese(result, target_lang='zh'):
+    """
+    Translate all subtitle segments to Chinese and create bilingual subtitles.
+
+    Args:
+        result: The transcription result object with segments.
+        target_lang: Target language code for translation (default: 'zh' for Chinese).
+
+    Returns:
+        list: List of segments with bilingual text (original + translation).
+    """
+    # Determine which translation service to use
+    if enable_google_translate or translation_service == 'google':
+        service = 'google'
+        enabled = enable_google_translate
+    elif enable_baidu_translate or translation_service == 'baidu':
+        service = 'baidu'
+        enabled = enable_baidu_translate
+    else:
+        return result.segments
+
+    if not enabled:
+        return result.segments
+
+    return translate_segments(result, target_lang=target_lang, service=service)
+
 def appendLine(result):
     if append:
         lastSegment = result.segments[-1]
@@ -640,12 +896,12 @@ def receive_jellyfin_webhook(
         ItemId: str = Body(None),
 ):
     if "Jellyfin-Server" in user_agent:
-        logging.debug(f"Jellyfin event detected is: {NotificationType}")
-        logging.debug(f"itemid is: {ItemId}")
-
+        logging.info(f"Jellyfin event detected is: {NotificationType}")
+        logging.info(f"itemid is: {ItemId}")
         if (NotificationType == "ItemAdded" and procaddedmedia) or (NotificationType == "PlaybackStart" and procmediaonplay):
             fullpath = get_jellyfin_file_name(ItemId, jellyfinserver, jellyfintoken)
-            logging.debug(f"Full file path: {fullpath}")
+            fullpath="D:\\temp\\视频\\测试视频\\Jinricp20260128_02_cut.mp4"
+            logging.info(f"Full file path: {fullpath}")
 
             # Queue item with Jellyfin metadata ID for delayed refresh
             gen_subtitles_queue(
@@ -852,8 +1108,9 @@ def asr_task_worker(task_data: dict) -> None:
         
         # Perform transcription
         result = model.transcribe(task=task, language=language, **args, verbose=None)
+
         appendLine(result)
-        
+
         # Set result for blocking endpoint
         if result_container:
             result_container.set_result(result.to_srt_vtt(filepath=None, word_level=word_level_highlight))
@@ -1179,8 +1436,9 @@ def start_model():
     global model
     with model_load_lock:
         if model is None:
-            logging.debug("Model was purged, need to re-create")
+            logging.debug(f"Model was purged, need to re-create")
             model = stable_whisper.load_faster_whisper(whisper_model, download_root=model_location, device=transcribe_device, cpu_threads=whisper_threads, num_workers=concurrent_transcriptions, compute_type=compute_type)
+            logging.info("模型加载完成")
 
 def schedule_model_cleanup():
     """Schedule model cleanup with a delay to allow concurrent requests.
@@ -1272,46 +1530,58 @@ def write_lrc(result, file_path):
             file.write(f"[{minutes:02d}:{seconds:02d}.{fraction:02d}]{text}\n")
 
 def gen_subtitles(file_path: str, transcription_type: str, force_language: LanguageCode = LanguageCode.NONE) -> None:
-    """Generates subtitles for a video file. 
+    """Generates subtitles for a video file.
 
     Args:
-        file_path: str - The path to the video file. 
+        file_path: str - The path to the video file.
         transcription_type: str - The type of transcription or translation to perform.
-        force_language: str - The language to force for transcription or translation. Default is None. 
+        force_language: str - The language to force for transcription or translation. Default is None.
     """
 
     try:
         start_model()
-        
-        # Check if the file is an audio file before trying to extract audio 
+
+        # Check if the file is an audio file before trying to extract audio
         file_name, file_extension = os.path.splitext(file_path)
         is_audio_file = isAudioFileExtension(file_extension)
-        
+
         data = file_path
         # Extract audio from the file if it has multiple audio tracks
         extracted_audio_file = handle_multiple_audio_tracks(file_path, force_language)
         # handle_multiple_audio_tracks now returns bytes directly
         if extracted_audio_file:
             data = extracted_audio_file
-        
+
         args = {}
         display_name = os.path.basename(file_path)
         args['progress_callback'] = ProgressHandler(display_name)
-            
+
         if custom_regroup and custom_regroup.lower() != 'default':
             args['regroup'] = custom_regroup
-            
-        args.update(kwargs)
-        
-        result = model.transcribe(data, language=force_language.to_iso_639_1(), task=transcription_type, verbose=None, **args)
 
+        args.update(kwargs)
+
+        result = model.transcribe(data, language=force_language.to_iso_639_1(), task=transcription_type, verbose=None, **args)
         appendLine(result)
+
+        # Translate segments for bilingual subtitles if enabled
+        if enable_baidu_translate or enable_google_translate:
+            # Determine target language based on active translation service
+            if enable_google_translate:
+                target_lang = google_translate_target_language
+            else:
+                target_lang = baidu_translate_target_language
+
+            result.segments = translate_segments_to_chinese(result, target_lang=target_lang)
+            # Update output language to reflect the translated language
+            output_language = LanguageCode.from_string(target_lang)
+        else:
+            output_language = LanguageCode.from_string(result.language)
 
         # If it is an audio file, write the LRC file
         if is_audio_file and lrc_for_audio_files:
             write_lrc(result, file_name + '.lrc')
         else:
-            output_language = LanguageCode.from_string(result.language)
             result.to_srt_vtt(name_subtitle(file_path, output_language), word_level=word_level_highlight)
 
     except Exception as e:

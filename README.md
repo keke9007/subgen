@@ -243,6 +243,7 @@ Create two separate Webhooks in Tautulli pointing to `http://<your-ip>:9000/taut
 | `SHOW_IN_SUBNAME_MODEL` | `True` | Adds the model used (e.g., `.medium`) to the output file name. |
 | `CUSTOM_REGROUP` | `cm_sl=84_sl=42++++++1` | Stable-TS grouping. Try to 'clean up' subtitles a bit. Set to `default` to use base Stable-TS. |
 
+### 🌐 Baidu Translation API (Bilingual Subtitles)*Enable Chinese bilingual subtitles by configuring Baidu Translation API.*| Variable | Default | Description ||---|---|---|| `ENABLE_BAIDU_TRANSLATE` | `false` | Set to `true` to enable bilingual subtitle translation. || `BAIDU_TRANSLATE_APPID` | `` | Your Baidu Translation API App ID (get from https://fanyi-api.baidu.com/). || `BAIDU_TRANSLATE_SECRET` | `` | Your Baidu Translation API Secret Key. || `BAIDU_TRANSLATE_TARGET_LANGUAGE` | `zh` | Target language code for translation (e.g., `zh` for Chinese, `jp` for Japanese). |**Note:** When enabled, each subtitle line will display both the original language and the translated language on separate lines.
 ### 📂 System, Paths & Network Settings
 | Variable | Default | Description |
 |---|---|---|
