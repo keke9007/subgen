@@ -1735,10 +1735,48 @@ def get_audio_track_by_language(audio_tracks, language):
             return track
     return None
 
+def extract_language_from_filename(file_path):
+    """
+    Extracts language code from filename pattern.
+    Supports patterns like: video.ko.mp4, movie.en.srt, show.ja.avi
+
+    Args:
+        file_path: The path to the file.
+
+    Returns:
+        LanguageCode: The language code extracted from the filename,
+                     or LanguageCode.NONE if no language pattern is found.
+    """
+    import os
+    import re
+
+    filename = os.path.basename(file_path)
+    # Remove extension and look for language code pattern
+    # Pattern: something.xx.something or xx.something
+    # Match 2-letter ISO 639-1 codes (like en, ko, ja, zh, etc.)
+    pattern = r'\.([a-z]{2,3})\.'
+    matches = re.findall(pattern, filename.lower())
+
+    for match in matches:
+        lang = LanguageCode.from_iso_639_1(match)
+        if lang and lang != LanguageCode.NONE:
+            return lang
+
+    # Also check for 3-letter codes
+    pattern_3 = r'\.([a-z]{3})\.'
+    matches_3 = re.findall(pattern_3, filename.lower())
+
+    for match in matches_3:
+        lang = LanguageCode.from_iso_639_2(match)
+        if lang and lang != LanguageCode.NONE:
+            return lang
+
+    return LanguageCode.NONE
+
 def choose_transcribe_language(file_path, forced_language):
     """
     Determines the language to be used for transcription based on the provided
-    file path and language preferences. 
+    file path and language preferences.
 
     Args:
         file_path: The path to the file for which the audio tracks are analyzed.
@@ -1747,20 +1785,27 @@ def choose_transcribe_language(file_path, forced_language):
     Returns:
         The language code to be used for transcription. It prioritizes the
         `forced_language`, then the environment variable `force_detected_language_to`,
+        then the language code from filename (e.g., a.ko.mp4 -> Korean),
         then the preferred audio language if available, and finally the default
         language of the audio tracks. Returns None if no language preference is
         determined.
     """
-    
+
     #logger.debug(f"choose_transcribe_language({file_path}, {forced_language})")
-    
-    if forced_language: 
-        logger.debug(f"ENV FORCE_LANGUAGE is set: Forcing language to {forced_language}") 
+
+    if forced_language:
+        logger.debug(f"ENV FORCE_LANGUAGE is set: Forcing language to {forced_language}")
         return forced_language
 
-    if force_detected_language_to: 
+    if force_detected_language_to:
         logger.debug(f"ENV FORCE_DETECTED_LANGUAGE_TO is set: Forcing detected language to {force_detected_language_to}")
         return force_detected_language_to
+
+    # Try to extract language from filename (e.g., a.ko.mp4 -> Korean)
+    language_from_filename = extract_language_from_filename(file_path)
+    if language_from_filename:
+        logger.debug(f"Language extracted from filename: {language_from_filename}")
+        return language_from_filename
 
     audio_tracks = get_audio_tracks(file_path)
     
