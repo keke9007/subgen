@@ -1597,7 +1597,23 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
         logging.info(f"gen_subtitles COMPLETED: {os.path.basename(file_path)}")
 
     except Exception as e:
+        error_message = str(e)
         logging.error(f"Error processing or transcribing {file_path} in {force_language}: {e}", exc_info=True)
+
+        # Re-queue task if CUDA out of memory error occurs
+        if "out of memory" in error_message.lower() or "cuda failed" in error_message.lower():
+            logging.warning(f"Detected CUDA out of memory error for {file_path}. Re-queuing task...")
+            # Wait a bit to allow GPU memory cleanup
+            import time
+            time.sleep(5)
+            # Re-queue the task with the same parameters
+            task = {
+                'path': file_path,
+                'transcribe_or_translate': transcription_type,
+                'force_language': force_language
+            }
+            task_queue.put(task)
+            logging.info(f"Task for {os.path.basename(file_path)} has been re-queued.")
 
     finally:
         delete_model()
