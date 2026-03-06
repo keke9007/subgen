@@ -900,7 +900,7 @@ def receive_jellyfin_webhook(
         logging.info(f"itemid is: {ItemId}")
         if (NotificationType == "ItemAdded" and procaddedmedia) or (NotificationType == "PlaybackStart" and procmediaonplay):
             fullpath = get_jellyfin_file_name(ItemId, jellyfinserver, jellyfintoken)
-            fullpath="D:\\temp\\视频\\测试视频\\Jinricp20260128_02_cut.mp4"
+            #fullpath="D:\\temp\\视频\\测试视频\\Jinricp20260128_02_cut.mp4"
             logging.info(f"Full file path: {fullpath}")
 
             # Queue item with Jellyfin metadata ID for delayed refresh
@@ -1365,7 +1365,7 @@ def detect_language_task(path, original_task_data=None):
         
     finally:
         delete_model()
-        
+
         # Queue transcription with detected language
         task_data = {
             'path': path,
@@ -1373,13 +1373,18 @@ def detect_language_task(path, original_task_data=None):
             'transcribe_or_translate': transcribe_or_translate,
             'force_language': detected_language
         }
-        
+
         # Carry over metadata (Plex IDs, etc.) from the original task
         if original_task_data:
             for key, value in original_task_data.items():
                 if key not in task_data:
                     task_data[key] = value
-        
+
+        # Remove the detect_language task from processing set before adding the transcribe task
+        # This allows the transcription task to be queued immediately after language detection completes
+        with task_queue._lock:
+            task_queue._processing.discard(path)
+
         if task_queue.put(task_data):
             logging.debug(f"Queued transcription for detected language: {path}")
         else:
@@ -1911,10 +1916,14 @@ def should_skip_file(file_path: str, target_language: LanguageCode) -> bool:
         return True
 
     # 3. Skip if a subtitle already exists in the target language.
-    if skip_if_to_transcribe_sub_already_exist and has_subtitle_language(file_path, target_language):
-        lang_name = target_language.to_name()
-        logging.info(f"Skipping {base_name}: Subtitles already exist in {lang_name}.")
-        return True
+    if skip_if_to_transcribe_sub_already_exist:
+        # If NAMESUBLANG is set, check for subtitles in the output language (namesublang)
+        # Otherwise, check for subtitles in the target language (audio language)
+        check_language = LanguageCode.from_string(namesublang) if namesublang and LanguageCode.is_valid_language(namesublang) else target_language
+        if has_subtitle_language(file_path, check_language):
+            lang_name = check_language.to_name()
+            logging.info(f"Skipping {base_name}: Subtitles already exist in {lang_name}.")
+            return True
 
     # 4. Skip if an internal subtitle exists in skipifinternalsublang language.
     if skipifinternalsublang and has_subtitle_language_in_file(file_path, skipifinternalsublang):
