@@ -1543,6 +1543,8 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
         force_language: str - The language to force for transcription or translation. Default is None.
     """
 
+    logging.info(f"gen_subtitles START: {os.path.basename(file_path)} with language={force_language}")
+
     try:
         start_model()
 
@@ -1566,7 +1568,9 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
 
         args.update(kwargs)
 
+        logging.info(f"Starting model.transcribe for {os.path.basename(file_path)}")
         result = model.transcribe(data, language=force_language.to_iso_639_1(), task=transcription_type, verbose=None, **args)
+        logging.info(f"model.transcribe completed for {os.path.basename(file_path)}")
         appendLine(result)
 
         # Translate segments for bilingual subtitles if enabled
@@ -1587,10 +1591,13 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
         if is_audio_file and lrc_for_audio_files:
             write_lrc(result, file_name + '.lrc')
         else:
+            logging.info(f"Writing subtitle file for {os.path.basename(file_path)}")
             result.to_srt_vtt(name_subtitle(file_path, output_language), word_level=word_level_highlight)
 
+        logging.info(f"gen_subtitles COMPLETED: {os.path.basename(file_path)}")
+
     except Exception as e:
-        logging.info(f"Error processing or transcribing {file_path} in {force_language}: {e}")
+        logging.error(f"Error processing or transcribing {file_path} in {force_language}: {e}", exc_info=True)
 
     finally:
         delete_model()
