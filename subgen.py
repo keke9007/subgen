@@ -1542,8 +1542,13 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
         transcription_type: str - The type of transcription or translation to perform.
         force_language: str - The language to force for transcription or translation. Default is None.
     """
+    global active_direct_tasks
 
     logging.info(f"gen_subtitles START: {os.path.basename(file_path)} with language={force_language}")
+
+    # Increment active_direct_tasks to prevent model cleanup during long transcriptions
+    with active_direct_tasks_lock:
+        active_direct_tasks += 1
 
     try:
         start_model()
@@ -1616,8 +1621,11 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
             logging.info(f"Task for {os.path.basename(file_path)} has been re-queued.")
 
     finally:
+        # Decrement active_direct_tasks to allow model cleanup after transcription completes
+        with active_direct_tasks_lock:
+            active_direct_tasks -= 1
         delete_model()
-        
+
 def define_subtitle_language_naming(language: LanguageCode, type):
     """
     Determines the naming format for a subtitle language based on the given type. 
