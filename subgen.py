@@ -188,8 +188,23 @@ google_translate_api_key = os.getenv('GOOGLE_TRANSLATE_API_KEY', '')
 enable_google_translate = convert_to_bool(os.getenv('ENABLE_GOOGLE_TRANSLATE', False))
 google_translate_target_language = os.getenv('GOOGLE_TRANSLATE_TARGET_LANGUAGE', 'zh-CN')  # Default to Chinese (Simplified)
 
-# Translation Service Selection (priority: google > baidu)
-translation_service = os.getenv('TRANSLATION_SERVICE', 'baidu').lower()  # 'baidu' or 'google'
+# Local MT (offline) Configuration
+enable_local_translate = convert_to_bool(os.getenv('ENABLE_LOCAL_TRANSLATE', False))
+#facebook/nllb-200-3.3B
+local_translate_model = os.getenv('LOCAL_TRANSLATE_MODEL', 'facebook/nllb-200-1.3B')
+local_translate_type = os.getenv('LOCAL_TRANSLATE_TYPE', 'nllb')
+local_translate_src_lang = os.getenv('LOCAL_TRANSLATE_SRC_LANG', '')
+local_translate_tgt_lang = os.getenv('LOCAL_TRANSLATE_TGT_LANG', '')
+local_translate_target_language = os.getenv('LOCAL_TRANSLATE_TARGET_LANGUAGE', 'zh')
+merge_translation_by_time = convert_to_bool(os.getenv('MERGE_TRANSLATION_BY_TIME', False))
+merge_translation_gap_seconds = float(os.getenv('MERGE_TRANSLATION_GAP_SECONDS', 1.0))
+
+# Whisper Translate (local) Configuration
+enable_whisper_translate = convert_to_bool(os.getenv('ENABLE_WHISPER_TRANSLATE', False))
+whisper_translate_target_language = os.getenv('WHISPER_TRANSLATE_TARGET_LANGUAGE', 'en')  # Whisper translate outputs English
+
+# Translation Service Selection (priority: google > baidu > local > whisper)
+translation_service = os.getenv('TRANSLATION_SERVICE', 'baidu').lower()  # 'baidu' | 'google' | 'local' | 'whisper'
 
 # Skip Configuration - with backwards compatibility
 skipifexternalsub = get_env_with_fallback('SKIP_IF_EXTERNAL_SUBTITLES_EXIST', 'SKIPIFEXTERNALSUB', False, convert_to_bool)
@@ -222,6 +237,9 @@ skip_if_language_is_not_set_but_subtitles_exist = get_env_with_fallback('SKIP_IF
 should_whiser_detect_audio_language = convert_to_bool(os.getenv('SHOULD_WHISPER_DETECT_AUDIO_LANGUAGE', False))
 show_in_subname_subgen = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_SUBGEN', True))
 show_in_subname_model = convert_to_bool(os.getenv('SHOW_IN_SUBNAME_MODEL', True))
+
+test_path= os.getenv('TESTPATH','')
+
 
 # Advanced Configuration
 try:
@@ -555,6 +573,8 @@ def baidu_translate_text(text, from_lang='auto', to_lang='zh'):
     Returns:
         str: Translated text, or original text if translation fails.
     """
+    if not text or len(text.strip()) < 2:
+        return text
     if not baidu_translate_appid or not baidu_translate_secret:
         logging.warning("Baidu Translation API credentials not configured, skipping translation.")
         return text
@@ -685,6 +705,47 @@ def google_translate_text(text, from_lang='auto', to_lang='zh-CN'):
         return text
 
 
+
+def chunk_segments_by_gap(segments, gap_seconds: float):
+    if not segments:
+        return []
+
+    chunks = []
+    current = [segments[0]]
+    for seg in segments[1:]:
+        gap = seg.start - current[-1].end
+        if gap is None or gap > gap_seconds:
+            chunks.append(current)
+            current = [seg]
+        else:
+            current.append(seg)
+    chunks.append(current)
+    return chunks
+
+
+def split_translation_by_lengths(text: str, lengths: List[int]) -> List[str]:
+    if not text:
+        return ["" for _ in lengths]
+    total = sum(lengths)
+    if total <= 0:
+        return [text] + ["" for _ in lengths[1:]]
+
+    out = []
+    idx = 0
+    for i, ln in enumerate(lengths):
+        if i == len(lengths) - 1:
+            out.append(text[idx:].strip())
+            break
+        take = max(1, int(round(len(text) * (ln / total))))
+        remaining = len(text) - idx
+        remaining_segs = len(lengths) - i
+        if remaining - take < remaining_segs - 1:
+            take = max(1, remaining - (remaining_segs - 1))
+        out.append(text[idx:idx + take].strip())
+        idx += take
+    return out
+
+
 def translate_segments(result, target_lang='zh', service='baidu'):
     """
     Translate all subtitle segments and create bilingual subtitles.
@@ -699,21 +760,39 @@ def translate_segments(result, target_lang='zh', service='baidu'):
     """
     logging.info(f"Translating {len(result.segments)} segments using {service}...")
 
+    def translate_text(text: str) -> str:
+        if service == 'google':
+            return google_translate_text(text, to_lang=target_lang)
+        return baidu_translate_text(text, to_lang=target_lang)
+
+    if merge_translation_by_time:
+        chunks = chunk_segments_by_gap(result.segments, merge_translation_gap_seconds)
+        translated_segments = []
+        for chunk in chunks:
+            chunk_text = " ".join([seg.text for seg in chunk])
+            translated_text = translate_text(chunk_text)
+            lengths = [len(seg.text) for seg in chunk]
+            translated_parts = split_translation_by_lengths(translated_text, lengths)
+
+            for seg, translated in zip(chunk, translated_parts):
+                bilingual_text = f"{seg.text}\n{translated}"
+                new_segment = Segment(
+                    start=seg.start,
+                    end=seg.end,
+                    text=bilingual_text,
+                    words=None,
+                    id=seg.id
+                )
+                translated_segments.append(new_segment)
+
+        logging.info("Translation complete.")
+        return translated_segments
+
     translated_segments = []
     for i, segment in enumerate(result.segments, 1):
         logging.debug(f"Translating segment {i}/{len(result.segments)}: {segment.text[:50]}...")
-
-        # Translate the segment text
-        if service == 'google':
-            translated_text = google_translate_text(segment.text, to_lang=target_lang)
-        else:
-            translated_text = baidu_translate_text(segment.text, to_lang=target_lang)
-
-        # Create bilingual text (original + translation)
+        translated_text = translate_text(segment.text)
         bilingual_text = f"{segment.text}\n{translated_text}"
-
-        # Create new segment with bilingual text
-        # Note: words must be None, otherwise text will be reconstructed from words
         new_segment = Segment(
             start=segment.start,
             end=segment.end,
@@ -727,6 +806,283 @@ def translate_segments(result, target_lang='zh', service='baidu'):
     return translated_segments
 
 
+
+def get_translation_service():
+    if translation_service == 'whisper':
+        return 'whisper', enable_whisper_translate
+    if translation_service == 'google':
+        return 'google', enable_google_translate
+    if translation_service == 'baidu':
+        return 'baidu', enable_baidu_translate
+    if translation_service == 'local':
+        return 'local', enable_local_translate
+
+    if enable_google_translate:
+        return 'google', True
+    if enable_baidu_translate:
+        return 'baidu', True
+    if enable_local_translate:
+        return 'local', True
+    if enable_whisper_translate:
+        return 'whisper', True
+
+    return None, False
+
+
+def get_translation_target_language(service: str) -> str | None:
+    if service == 'google':
+        return google_translate_target_language
+    if service == 'baidu':
+        return baidu_translate_target_language
+    if service == 'local':
+        return local_translate_target_language
+    if service == 'whisper':
+        target_lang = whisper_translate_target_language or 'en'
+        if LanguageCode.from_string(target_lang) != LanguageCode.ENGLISH:
+            logging.warning("Whisper translate only supports English; forcing target language to 'en'.")
+            return 'en'
+        return 'en'
+    return None
+
+
+_local_mt_model = None
+_local_mt_tokenizer = None
+_local_mt_device = 'cpu'
+_local_mt_type = None
+_local_mt_src_lang = None
+_local_mt_tgt_lang = None
+_local_mt_forced_bos_token_id = None
+
+
+def get_local_mt():
+    global _local_mt_model, _local_mt_tokenizer, _local_mt_device
+    global _local_mt_type, _local_mt_src_lang, _local_mt_tgt_lang, _local_mt_forced_bos_token_id
+
+    if _local_mt_model is not None and _local_mt_tokenizer is not None:
+        return _local_mt_model, _local_mt_tokenizer
+
+    try:
+        from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    except Exception:
+        logging.error("Local MT requires transformers. Install with: pip install transformers sentencepiece")
+        return None, None
+
+    model_name = (local_translate_model or '').strip()
+    model_type = (local_translate_type or '').strip().lower()
+
+    if not model_type:
+        if 'nllb' in model_name.lower():
+            model_type = 'nllb'
+        elif 'm2m100' in model_name.lower():
+            model_type = 'm2m100'
+        else:
+            model_type = 'opus'
+
+    if model_type == 'nllb':
+        src_lang = local_translate_src_lang or 'eng_Latn'
+        tgt_lang = local_translate_tgt_lang or 'zho_Hans'
+    elif model_type == 'm2m100':
+        src_lang = local_translate_src_lang or 'en'
+        tgt_lang = local_translate_tgt_lang or 'zh'
+    else:
+        src_lang = local_translate_src_lang or 'en'
+        tgt_lang = local_translate_tgt_lang or 'zh'
+
+    _local_mt_type = model_type
+    _local_mt_src_lang = src_lang
+    _local_mt_tgt_lang = tgt_lang
+    _local_mt_forced_bos_token_id = None
+
+    _local_mt_tokenizer = AutoTokenizer.from_pretrained(model_name)
+    _local_mt_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+
+    if model_type in ('nllb', 'm2m100'):
+        try:
+            _local_mt_tokenizer.src_lang = src_lang
+            if hasattr(_local_mt_tokenizer, 'lang_code_to_id'):
+                _local_mt_forced_bos_token_id = _local_mt_tokenizer.lang_code_to_id.get(tgt_lang)
+            if _local_mt_forced_bos_token_id is None and hasattr(_local_mt_tokenizer, 'get_lang_id'):
+                _local_mt_forced_bos_token_id = _local_mt_tokenizer.get_lang_id(tgt_lang)
+        except Exception:
+            logging.warning("Local MT language settings failed; falling back to model defaults.")
+
+    if transcribe_device.lower() == 'cuda' and torch.cuda.is_available():
+        _local_mt_device = 'cuda'
+        _local_mt_model = _local_mt_model.to('cuda')
+
+    _local_mt_model.eval()
+    return _local_mt_model, _local_mt_tokenizer
+
+
+
+def local_translate_texts(texts: List[str]) -> List[str]:
+    model, tokenizer = get_local_mt()
+    if not model or not tokenizer:
+        return texts
+    if not texts:
+        return texts
+
+    batch_size = 16
+    total = len(texts)
+    translated_all = []
+
+    for start in range(0, total, batch_size):
+        end = min(start + batch_size, total)
+        batch = texts[start:end]
+
+        inputs = tokenizer(batch, return_tensors='pt', truncation=True, padding=True)
+        if _local_mt_device == 'cuda':
+            inputs = {k: v.to('cuda') for k, v in inputs.items()}
+
+        gen_kwargs = {'max_new_tokens': 256}
+        if _local_mt_forced_bos_token_id is not None:
+            gen_kwargs['forced_bos_token_id'] = _local_mt_forced_bos_token_id
+
+        with torch.no_grad():
+            outputs = model.generate(**inputs, **gen_kwargs)
+
+        decoded = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        translated_all.extend(decoded if decoded else batch)
+
+        pct = int((end / total) * 100)
+        logging.info(f"Local translation progress: {end}/{total} ({pct}%)")
+
+    return translated_all
+
+
+
+def local_translate_segments(result, target_lang: str):
+    if not enable_local_translate:
+        return result.segments
+
+    if merge_translation_by_time:
+        chunks = chunk_segments_by_gap(result.segments, merge_translation_gap_seconds)
+        chunk_texts = [" ".join([seg.text for seg in chunk]) for chunk in chunks]
+        chunk_translations = local_translate_texts(chunk_texts)
+
+        translated_segments = []
+        for chunk, translated_text in zip(chunks, chunk_translations):
+            lengths = [len(seg.text) for seg in chunk]
+            translated_parts = split_translation_by_lengths(translated_text, lengths)
+
+            for seg, translated in zip(chunk, translated_parts):
+                bilingual_text = f"{seg.text}\n{translated}"
+                new_segment = Segment(
+                    start=seg.start,
+                    end=seg.end,
+                    text=bilingual_text,
+                    words=None,
+                    id=seg.id
+                )
+                translated_segments.append(new_segment)
+
+        return translated_segments
+
+    translated_texts = local_translate_texts([seg.text for seg in result.segments])
+    translated_segments = []
+    for seg, translated in zip(result.segments, translated_texts):
+        bilingual_text = f"{seg.text}\n{translated}"
+        new_segment = Segment(
+            start=seg.start,
+            end=seg.end,
+            text=bilingual_text,
+            words=None,
+            id=seg.id
+        )
+        translated_segments.append(new_segment)
+
+    return translated_segments
+
+
+def local_translate_segments_from_translated(original_result, translated_result, target_lang: str):
+    if not enable_local_translate:
+        return original_result.segments
+
+    translated_texts = local_translate_texts([seg.text for seg in translated_result.segments])
+    min_len = min(len(original_result.segments), len(translated_texts))
+
+    translated_segments = []
+    for i in range(min_len):
+        orig = original_result.segments[i]
+        translated = translated_texts[i]
+        bilingual_text = f"{orig.text}\n{translated}"
+        new_segment = Segment(
+            start=orig.start,
+            end=orig.end,
+            text=bilingual_text,
+            words=None,
+            id=orig.id
+        )
+        translated_segments.append(new_segment)
+
+    for i in range(min_len, len(original_result.segments)):
+        seg = original_result.segments[i]
+        new_segment = Segment(
+            start=seg.start,
+            end=seg.end,
+            text=seg.text,
+            words=None,
+            id=seg.id
+        )
+        translated_segments.append(new_segment)
+
+    return translated_segments
+
+
+def whisper_translate_result(data, force_language: LanguageCode, args):
+    translate_args = dict(args)
+    translate_args['progress_callback'] = None
+
+    return model.transcribe(
+        data,
+        language=force_language.to_iso_639_1(),
+        task='translate',
+        verbose=None,
+        **translate_args
+    )
+
+
+def merge_segments_with_translation(original_result, translated_result):
+    min_len = min(len(original_result.segments), len(translated_result.segments))
+    if len(original_result.segments) != len(translated_result.segments):
+        logging.warning(
+            f"Whisper translate segment count mismatch: {len(original_result.segments)} vs {len(translated_result.segments)}. Aligning by index."
+        )
+
+    translated_segments = []
+    for i in range(min_len):
+        orig = original_result.segments[i]
+        trans = translated_result.segments[i]
+        bilingual_text = f"{orig.text}\n{trans.text}"
+        new_segment = Segment(
+            start=orig.start,
+            end=orig.end,
+            text=bilingual_text,
+            words=None,
+            id=orig.id
+        )
+        translated_segments.append(new_segment)
+
+    for i in range(min_len, len(original_result.segments)):
+        seg = original_result.segments[i]
+        new_segment = Segment(
+            start=seg.start,
+            end=seg.end,
+            text=seg.text,
+            words=None,
+            id=seg.id
+        )
+        translated_segments.append(new_segment)
+
+    return translated_segments
+
+
+def translate_segments_with_whisper(original_result, data, force_language: LanguageCode, args):
+    logging.info("Translating segments with Whisper local model...")
+    translate_result = whisper_translate_result(data, force_language, args)
+    return merge_segments_with_translation(original_result, translate_result), translate_result
+
+
 def translate_segments_to_chinese(result, target_lang='zh'):
     """
     Translate all subtitle segments to Chinese and create bilingual subtitles.
@@ -738,18 +1094,18 @@ def translate_segments_to_chinese(result, target_lang='zh'):
     Returns:
         list: List of segments with bilingual text (original + translation).
     """
-    # Determine which translation service to use
-    if enable_google_translate or translation_service == 'google':
-        service = 'google'
-        enabled = enable_google_translate
-    elif enable_baidu_translate or translation_service == 'baidu':
-        service = 'baidu'
-        enabled = enable_baidu_translate
-    else:
+    service, enabled = get_translation_service()
+    if not enabled or service in (None, 'whisper'):
         return result.segments
 
-    if not enabled:
+    if not target_lang:
+        target_lang = get_translation_target_language(service)
+
+    if not target_lang:
         return result.segments
+
+    if service == 'local':
+        return local_translate_segments(result, target_lang=target_lang)
 
     return translate_segments(result, target_lang=target_lang, service=service)
 
@@ -900,9 +1256,9 @@ def receive_jellyfin_webhook(
         logging.info(f"itemid is: {ItemId}")
         if (NotificationType == "ItemAdded" and procaddedmedia) or (NotificationType == "PlaybackStart" and procmediaonplay):
             fullpath = get_jellyfin_file_name(ItemId, jellyfinserver, jellyfintoken)
-            #fullpath="D:\\temp\\视频\\测试视频\\Jinricp20260128_02_cut.mp4"
+            if test_path:
+                fullpath=test_path
             logging.info(f"Full file path: {fullpath}")
-
             # Queue item with Jellyfin metadata ID for delayed refresh
             gen_subtitles_queue(
                 path_mapping(fullpath), 
@@ -1579,16 +1935,48 @@ def gen_subtitles(file_path: str, transcription_type: str, force_language: Langu
         appendLine(result)
 
         # Translate segments for bilingual subtitles if enabled
-        if enable_baidu_translate or enable_google_translate:
-            # Determine target language based on active translation service
-            if enable_google_translate:
-                target_lang = google_translate_target_language
+        service, enabled = get_translation_service()
+        if enabled:
+            logging.info(f"Starting translate {service}")
+            if service == 'whisper':
+                if transcription_type == 'translate':
+                    if enable_local_translate and local_translate_target_language and local_translate_target_language != 'en':
+                        result.segments = local_translate_segments(result, target_lang=local_translate_target_language)
+                        output_language = LanguageCode.from_string(local_translate_target_language)
+                    else:
+                        logging.info("Whisper translate enabled but task is translate; skipping bilingual translation.")
+                        output_language = LanguageCode.ENGLISH
+                else:
+                    bilingual_segments, translate_result = translate_segments_with_whisper(result, data, force_language, args)
+                    if enable_local_translate and local_translate_target_language and local_translate_target_language != 'en':
+                        result.segments = local_translate_segments_from_translated(
+                            result,
+                            translate_result,
+                            target_lang=local_translate_target_language
+                        )
+                        output_language = LanguageCode.from_string(local_translate_target_language)
+                    else:
+                        result.segments = bilingual_segments
+                        target_lang = get_translation_target_language('whisper')
+                        if not target_lang:
+                            output_language = LanguageCode.from_string(result.language)
+                        else:
+                            output_language = LanguageCode.from_string(target_lang)
+            elif service == 'local':
+                target_lang = get_translation_target_language('local')
+                if not target_lang:
+                    output_language = LanguageCode.from_string(result.language)
+                else:
+                    result.segments = local_translate_segments(result, target_lang=target_lang)
+                    output_language = LanguageCode.from_string(target_lang)
             else:
-                target_lang = baidu_translate_target_language
+                target_lang = get_translation_target_language(service)
+                if not target_lang:
+                    output_language = LanguageCode.from_string(result.language)
+                else:
+                    result.segments = translate_segments_to_chinese(result, target_lang=target_lang)
+                    output_language = LanguageCode.from_string(target_lang)
 
-            result.segments = translate_segments_to_chinese(result, target_lang=target_lang)
-            # Update output language to reflect the translated language
-            output_language = LanguageCode.from_string(target_lang)
         else:
             output_language = LanguageCode.from_string(result.language)
 
@@ -1977,6 +2365,10 @@ def should_skip_file(file_path: str, target_language: LanguageCode) -> bool:
     """
     base_name = os.path.basename(file_path)
     file_name, file_ext = os.path.splitext(base_name)
+    upper_name = file_name.upper()
+    if upper_name.endswith("-C") or upper_name.endswith("-CH"):
+        logging.info(f"Skipping {base_name}: Filename ends with -C or -CH (assumed internal subtitles).")
+        return True
     if transcribe_or_translate == 'translate': 
         target_language = LanguageCode.ENGLISH # Force our target language as english if we are translating
     # 1. Skip if it's an audio file and an LRC file already exists.
@@ -2390,7 +2782,7 @@ def refresh_jellyfin_metadata(itemid: str, server_ip: str, jellyfin_token: str) 
 def get_jellyfin_file_name(item_id: str, jellyfin_url: str, jellyfin_token: str) -> str:
     """Gets the full path to a file from the Jellyfin server.
     Args:
-        jellyfin_url: The URL of the Jellyfin server.
+        jellyfin_url: The URL ofT the Jellyfin server.
         jellyfin_token: The Jellyfin token.
         item_id: The ID of the item in the Jellyfin library.
     Returns:
@@ -2400,7 +2792,7 @@ def get_jellyfin_file_name(item_id: str, jellyfin_url: str, jellyfin_token: str)
     headers = {
         "Authorization": f"MediaBrowser Token={jellyfin_token}",
     }
-
+    logging.info(f"{jellyfin_url}")
     # Cheap way to get the admin user id, and save it for later use.
     users = json.loads(requests.get(f"{jellyfin_url}/Users", headers=headers).content)
     jellyfin_admin = get_jellyfin_admin(users)
@@ -2545,6 +2937,7 @@ if __name__ == "__main__":
     logging.info(f"Subgen v{subgen_version}")
     logging.info(f"Threads: {str(whisper_threads)}, Concurrent transcriptions: {str(concurrent_transcriptions)}")
     logging.info(f"Transcribe device: {transcribe_device}, Model: {whisper_model}")
+    logging.info(f"testpath {test_path}",)
     os.environ["KMP_DUPLICATE_LIB_OK"]="TRUE"
     if transcribe_folders:
         transcribe_existing(transcribe_folders)
